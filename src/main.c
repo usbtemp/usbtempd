@@ -42,12 +42,14 @@ int create_listen_socket()
     }
     rv = bind(sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
     if (rv < 0) {
+      close(sockfd);
       fprintf(stderr, "Port %s already in use!\n", port);
       continue;
     }
     listen(sockfd, BACKLOG);
     rv = fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL) | O_NONBLOCK);
     if (rv < 0) {
+      close(sockfd);
       printf("fcntl() error\n");
     }
     break;
@@ -60,34 +62,55 @@ int create_listen_socket()
 }
 
 static volatile int failure = 0;
+static volatile int valid = 0;
 static unsigned char rom[DS18X20_ROM_SIZE];
-float temp;
+static float temp;
 
 void *onewire(void *arg)
 {
   int serial_fd;
   char *serialport;
   struct timeval wait_tv;
-
-  serialport = (char *)arg;
-  serial_fd = DS18B20_open(serialport);
-  if (serial_fd < 0) {
-    failure = 1;
-    return NULL;
-  }
   
-  if (DS18B20_rom(serial_fd, rom) < 0) {
-    fprintf(stderr, "%s\n", DS18B20_errmsg());
-    close(serial_fd);
-    return NULL;
-  }
+  serial_fd = 0;
   
   while (!failure) {
+
+    if (!serial_fd)
+    {
+      valid = 0;
+      serialport = (char *)arg;
+      if (serial_fd > 0)
+      {
+        close(serial_fd);
+      }
+      serial_fd = DS18B20_open(serialport);
+      if (serial_fd < 0)
+      {
+        serial_fd = 0;
+        wait_tv.tv_sec = 5;
+        wait_tv.tv_usec = 0;
+        select(0, NULL, NULL, NULL, &wait_tv);
+        continue;
+      }
+      else if (DS18B20_rom(serial_fd, rom) < 0)
+      {
+        fprintf(stderr, "%s\n", DS18B20_errmsg());
+        close(serial_fd);
+        serial_fd = 0;
+        continue;
+      }
+      else
+      {
+        printf("Connected.\n");
+      }
+    }
     
     if (DS18B20_measure(serial_fd) < 0) {
       fprintf(stderr, "%s\n", DS18B20_errmsg());
       close(serial_fd);
-      return NULL;
+      serial_fd = 0;
+      continue;
     }
 
     wait_tv.tv_usec = 0;
@@ -96,9 +119,11 @@ void *onewire(void *arg)
     
     if (DS18B20_acquire(serial_fd, &temp) < 0) {
       fprintf(stderr, "%s\n", DS18B20_errmsg());
-      return NULL;
+      close(serial_fd);
+      serial_fd = 0;
+      continue;
     }
-
+    valid = 1;
   }
 
   close(serial_fd);
@@ -135,7 +160,6 @@ void *net(void *arg)
       fprintf(stderr, "select() err!\n");
     }
     if (FD_ISSET(listen_fd, &readfds)) {
-      printf("accept()");
       sin_size = sizeof(struct sockaddr_storage);
       new_fd = accept(listen_fd, (struct sockaddr *)&their_addr, &sin_size);
       file = fdopen(new_fd, "w");
@@ -145,7 +169,12 @@ void *net(void *arg)
       else {
         fprintf(file, "%02x%02x%02x%02x%02x%02x%02x%02x: ", *rom, *(rom + 1), *(rom + 2), *(rom + 3), *(rom + 4), *(rom + 5), *(rom + 6), *(rom + 7));
       }
-      fprintf(file, "%.2f\n", temp);
+      if (valid) {
+        fprintf(file, "%.2f\n", temp);
+      }
+      else {
+        fprintf(file, "-\n");
+      }
       fflush(file);
       fclose(file);
       close(new_fd);
