@@ -55,7 +55,7 @@ int create_listen_socket()
     break;
   }
   if (!ptr) {
-    sockfd = -1;
+    return -1;
   }
 
   return sockfd;
@@ -80,28 +80,26 @@ void *onewire(void *arg)
     {
       valid = 0;
       serialport = (char *)arg;
-      if (serial_fd > 0)
-      {
+      if (serial_fd > 0) {
         close(serial_fd);
+        serial_fd = 0;
       }
       serial_fd = DS18B20_open(serialport);
-      if (serial_fd < 0)
-      {
+      if (serial_fd < 0) {
+        fprintf(stderr, "Cannot open serial port!\n");
         serial_fd = 0;
         wait_tv.tv_sec = 5;
         wait_tv.tv_usec = 0;
         select(0, NULL, NULL, NULL, &wait_tv);
         continue;
       }
-      else if (DS18B20_rom(serial_fd, rom) < 0)
-      {
+      else if (DS18B20_rom(serial_fd, rom) < 0) {
         fprintf(stderr, "%s\n", DS18B20_errmsg());
         close(serial_fd);
         serial_fd = 0;
         continue;
       }
-      else
-      {
+      else {
         printf("Connected.\n");
       }
     }
@@ -214,10 +212,16 @@ int main(int argc, char **argv)
     switch (c) {
 
       case 'n':
+        if (name) {
+          free(name);
+        }
         name = strdup(optarg);
         break;
 
       case 's':
+        if (serialport) {
+          free(serialport);
+        }
         serialport = strdup(optarg);
         break;
     }

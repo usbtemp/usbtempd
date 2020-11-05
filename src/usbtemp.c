@@ -1,5 +1,4 @@
 #include <fcntl.h>
-#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,22 +8,22 @@
 #include <termios.h>
 #include <unistd.h>
 
-#include <usbtemp.h>
+#include "usbtemp.h"
 
 #define TIMEOUT 1
 #define DS18X20_GENERATOR 0x8c
 
 static char* ut_msgs[] = {
   "",
-  "Error, could not get baud rate!",
-  "Error, could not set baud rate!",
+  "Error, could not get baudrate!",
+  "Error, could not set baudrate!",
   "Error, serial port does not exist!",
   "Error, you don't have rw permission to access serial port!",
   "Error, failed to open serial port device!",
   "Error, sensor not found!", /* 6 */
   "Error, sensor CRC mismatch!",
   "Warining, not expected sensor response!",
-  "Error, could not send data"
+  "Error, could not send data!"
 };
 
 int ut_errno;
@@ -43,10 +42,12 @@ static unsigned char lsb_crc8(unsigned char *data_in, unsigned int len, const un
     crc ^= *(data_in + i);
     bit_counter = 8;
     do {
-      if (crc & 0x01)
+      if (crc & 0x01) {
         crc = (((crc >> 1) & 0x7f) ^ generator);
-      else
+      }
+      else {
         crc = (crc >> 1) & 0x7f;
+      }
       bit_counter--;
     } while (bit_counter > 0);
   }
@@ -99,7 +100,8 @@ static int owReset(int fd)
           /* Ground. */
         case 0xf0:
           /* No response. */
-          rv = -1; break;
+          rv = -1;
+          break;
         default:
           /* Got a response */
           rv = 0;
@@ -143,7 +145,7 @@ static unsigned char owWriteByte(int fd, unsigned char wbuff)
   }
 
   timeout_tv.tv_usec = 0;
-  timeout_tv.tv_sec = 1;
+  timeout_tv.tv_sec = TIMEOUT;
 
   FD_ZERO(&readset);
   FD_SET(fd, &readset);
@@ -162,11 +164,11 @@ static unsigned char owWriteByte(int fd, unsigned char wbuff)
           remaining--;
         }
       }
-      else
+      else {
         return 0xff;
+      }
     }
     else {
-      /* At last timeout will terminate while-loop. */
       return 0xff;
     }
   }
@@ -180,19 +182,17 @@ static unsigned char owRead(int fd)
 
 static int owWrite(int fd, unsigned char wbuff)
 {
-  if (owWriteByte(fd, wbuff) != wbuff)
-   return -1;
-  return 0;
+  return (owWriteByte(fd, wbuff) == wbuff) ? 0 : -1;
 }
 
 static int file_exists(const char *filename)
 {
   struct stat st;
+
   return (stat(filename, &st) == 0);
 }
 
-
-int DS18B20_measure(int fd)
+static int DS18B20_start(int fd)
 {
   if (owReset(fd) < 0) {
     ut_errno = 6;
@@ -200,6 +200,14 @@ int DS18B20_measure(int fd)
   }
   if (owWrite(fd, 0xcc) < 0) {
     ut_errno = 8;
+    return -1;
+  }
+  return 0;
+}
+
+int DS18B20_measure(int fd)
+{
+  if (DS18B20_start(fd) < 0) {
     return -1;
   }
   if (owWrite(fd, 0x44) < 0) {
@@ -209,45 +217,94 @@ int DS18B20_measure(int fd)
   return 0;
 }
 
-int DS18B20_acquire(int fd, float *temperature)
+static int DS18B20_sp(int fd, unsigned char *sp)
 {
-  unsigned short T;
-  unsigned char i, crc, sp_sensor[DS18X20_SP_SIZE];
+  unsigned char i, crc;
 
-  if (owReset(fd) < 0) {
-    ut_errno = 6;
-    return -1;
-  }
-  if (owWrite(fd, 0xcc) < 0) {
-    ut_errno = 8;
+  if (DS18B20_start(fd) < 0) {
     return -1;
   }
   if (owWrite(fd, 0xbe) < 0) {
     ut_errno = 8;
     return -1;
   }
-
   for (i = 0; i < DS18X20_SP_SIZE; i++) {
-    sp_sensor[i] = owRead(fd);
+    *(sp + i) = owRead(fd);
   }
 
-  if ((sp_sensor[4] & 0x9f) != 0x1f) {
+  if ((*(sp + 4) & 0x9f) != 0x1f) {
     ut_errno = 6;
     return -1;
   }
 
-  crc = lsb_crc8(&sp_sensor[0], DS18X20_SP_SIZE - 1, DS18X20_GENERATOR);
-  if (sp_sensor[DS18X20_SP_SIZE - 1] != crc) {
+  crc = lsb_crc8(sp, DS18X20_SP_SIZE - 1, DS18X20_GENERATOR);
+  if (*(sp + DS18X20_SP_SIZE - 1) != crc) {
     ut_errno = 7;
     return -1;
   }
 
-  T = (sp_sensor[1] << 8) + (sp_sensor[0] & 0xff);
-  if ((T >> 15) & 0x01) {
-    T--;
-    T ^= 0xffff;
-    T *= -1;
+  return 0;
+}
+
+int DS18B20_setprecision(int fd, int precision)
+{
+  int i, rv;
+  unsigned char cfg_old, cfg[4], sp_sensor[DS18X20_SP_SIZE];
+  unsigned char *p;
+
+  p = cfg + 3;
+  *p = 0x1f | ((unsigned char)(precision - 9) << 5);
+
+  rv = DS18B20_sp(fd, sp_sensor);
+  if (rv < 0) {
+    return rv;
   }
+
+  cfg_old = sp_sensor[DS18B20_SP_CONFIG];
+  if (cfg_old == *p) {
+    return 0;
+  }
+
+  p--;
+  *p-- = sp_sensor[DS18B20_SP_TL];
+  *p-- = sp_sensor[DS18B20_SP_TH];
+  *p = DS18B20_SP_WRITE;
+
+  if (DS18B20_start(fd) < 0) {
+    return -1;
+  }
+  for (i = 0; i < 4; i++) {
+    if (owWrite(fd, *p++) < 0) {
+      ut_errno = 8;
+      return -1;
+    }
+  }
+
+  if (DS18B20_start(fd) < 0) {
+    return -1;
+  }
+  if (owWrite(fd, DS18B20_SP_SAVE) < 0) {
+    ut_errno = 8;
+    return -1;
+  }
+
+  return 0;
+}
+
+int DS18B20_acquire(int fd, float *temperature)
+{
+  int rv;
+  short T;
+  unsigned short uT;
+  unsigned char sp_sensor[DS18X20_SP_SIZE];
+
+  rv = DS18B20_sp(fd, sp_sensor);
+  if (rv < 0) {
+    return rv;
+  }
+
+  uT = (sp_sensor[1] << 8) | (sp_sensor[0] & 0xff);
+  T = (short)uT; /* Force using leading bit as a sign. */
   *temperature = (float)T / 16;
 
   return 0;
@@ -271,7 +328,7 @@ int DS18B20_rom(int fd, unsigned char *rom)
   }
 
   crc = lsb_crc8(rom, DS18X20_ROM_SIZE - 1, DS18X20_GENERATOR);
-  if (rom[DS18X20_ROM_SIZE - 1] != crc) {
+  if (*(rom + DS18X20_ROM_SIZE - 1) != crc) {
     ut_errno = 7;
     return -1;
   }
@@ -279,7 +336,12 @@ int DS18B20_rom(int fd, unsigned char *rom)
   return 0;
 }
 
-int DS18B20_open(const char *serial_port)
+int is_fd_valid(int fd)
+{
+  return (fd > 0);
+}
+
+int owOpen(const char *serial_port)
 {
   int fd;
   struct termios term;
@@ -311,11 +373,35 @@ int DS18B20_open(const char *serial_port)
 
   if (tcsetattr(fd, TCSANOW, &term) < 0) {
     close(fd);
-    ut_errno = 0;
+    ut_errno = 2;
     return -1;
   }
 
   tcflush(fd, TCIOFLUSH);
 
   return fd;
+}
+
+int DS18B20_open(const char *serial_port)
+{
+  return owOpen(serial_port);
+}
+
+static void owClose(int fd)
+{
+  close(fd);
+}
+
+void DS18B20_close(int fd)
+{
+  return owClose(fd);
+}
+
+void wait_1s(void)
+{
+  struct timeval wait_tv;
+
+  wait_tv.tv_usec = 0;
+  wait_tv.tv_sec = 1;
+  select(0, NULL, NULL, NULL, &wait_tv);
 }
