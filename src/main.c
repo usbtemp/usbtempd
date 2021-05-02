@@ -14,31 +14,35 @@
 
 #define BACKLOG 10
 #define PORT 2000
- 
+
 int create_listen_socket()
 {
   struct addrinfo hints, *servinfo, *ptr;
   int rv;
   int sockfd;
   char port[6];
-  
+  int enable = 1;
+
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_INET;
   hints.ai_flags = AI_PASSIVE;
   hints.ai_socktype = SOCK_STREAM;
-  
+
   sprintf(port, "%d", PORT);
-  
+
   rv = getaddrinfo(NULL, port, &hints, &servinfo);
   if (rv) {
     printf("getaddrinfo() error\n");
     return -1;
   }
-  
+
   for (ptr = servinfo; ptr; ptr = ptr->ai_next) {
     sockfd = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol);
     if (sockfd < 0) {
       continue;
+    }
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0) {
+      printf("setsockopt(SO_REUSEADDR) failed");
     }
     rv = bind(sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
     if (rv < 0) {
@@ -61,36 +65,52 @@ int create_listen_socket()
   return sockfd;
 }
 
-static volatile int failure = 0;
-static volatile int valid = 0;
+static int valid = 0;
 static unsigned char rom[DS18X20_ROM_SIZE];
 static float temp;
+
+static int verbose;
+static int onewire_pipe[2], net_pipe[2];
+
+void terminate(void)
+{
+  uint8_t c = 0;
+  write(net_pipe[1], &c, 1);
+  write(onewire_pipe[1], &c, 1);
+}
 
 void *onewire(void *arg)
 {
   int serial_fd;
   char *serialport;
+  fd_set readfds;
   struct timeval wait_tv;
-  
-  serial_fd = 0;
-  
-  while (!failure) {
 
-    if (!serial_fd)
-    {
+  serial_fd = 0; /* disconnected: 0 */
+
+  while (1) {
+
+    if (!serial_fd) {
       valid = 0;
       serialport = (char *)arg;
+
       if (serial_fd > 0) {
         close(serial_fd);
         serial_fd = 0;
       }
       serial_fd = DS18B20_open(serialport);
+
       if (serial_fd < 0) {
         fprintf(stderr, "Cannot open serial port!\n");
         serial_fd = 0;
+
         wait_tv.tv_sec = 5;
         wait_tv.tv_usec = 0;
-        select(0, NULL, NULL, NULL, &wait_tv);
+        FD_ZERO(&readfds);
+        FD_SET(onewire_pipe[0], &readfds);
+        if (select(onewire_pipe[0] + 1, &readfds, NULL, NULL, &wait_tv)) {
+          break;
+        }
         continue;
       }
       else if (DS18B20_rom(serial_fd, rom) < 0) {
@@ -100,10 +120,10 @@ void *onewire(void *arg)
         continue;
       }
       else {
-        printf("Connected.\n");
+        printf("Connected to %02x%02x%02x%02x%02x%02x%02x%02x.\n", *rom, *(rom + 1), *(rom + 2), *(rom + 3), *(rom + 4), *(rom + 5), *(rom + 6), *(rom + 7));
       }
     }
-    
+
     if (DS18B20_measure(serial_fd) < 0) {
       fprintf(stderr, "%s\n", DS18B20_errmsg());
       close(serial_fd);
@@ -113,8 +133,12 @@ void *onewire(void *arg)
 
     wait_tv.tv_usec = 0;
     wait_tv.tv_sec = 1;
-    select(0, NULL, NULL, NULL, &wait_tv);
-    
+    FD_ZERO(&readfds);
+    FD_SET(onewire_pipe[0], &readfds);
+    if (select(onewire_pipe[0] + 1, &readfds, NULL, NULL, &wait_tv)) {
+      break;
+    }
+
     if (DS18B20_acquire(serial_fd, &temp) < 0) {
       fprintf(stderr, "%s\n", DS18B20_errmsg());
       close(serial_fd);
@@ -124,7 +148,16 @@ void *onewire(void *arg)
     valid = 1;
   }
 
-  close(serial_fd);
+  if (serial_fd > 0) {
+    close(serial_fd);
+    serial_fd = 0;
+  }
+
+  if (verbose) {
+    printf("onewire thread quit\n");
+  }
+
+  terminate();
 
   return NULL;
 }
@@ -138,21 +171,25 @@ void *net(void *arg)
   socklen_t sin_size;
   fd_set readfds;
   FILE *file;
+  int max_fd;
   char *name;
-  
+
   listen_fd = create_listen_socket();
   if (listen_fd < 0) {
-    failure = 1;
-    return NULL;
+    goto end;
   }
-  
+
   name = (char *)arg;
-  while (!failure) {
-    
+  while (1) {
+
     FD_ZERO(&readfds);
     FD_SET(listen_fd, &readfds);
-
-    select_rv = select(listen_fd + 1, &readfds, NULL, NULL, NULL);
+    FD_SET(net_pipe[0], &readfds);
+    max_fd = listen_fd > net_pipe[0] ? listen_fd : net_pipe[0];
+    select_rv = select(max_fd + 1, &readfds, NULL, NULL, NULL);
+    if (FD_ISSET(net_pipe[0], &readfds)) {
+      break;
+    }
 
     if (select_rv != 1) {
       fprintf(stderr, "select() err!\n");
@@ -179,15 +216,33 @@ void *net(void *arg)
     }
   }
   close(listen_fd);
-  
+
+  if (verbose) {
+    printf("net thread quit\n");
+  }
+
+end:
+
+  terminate();
+
   return NULL;
 }
 
 void signal_handler(int signum)
 {
   if (signum == SIGTERM) {
-    failure = 1;
+    if (verbose) {
+      printf("SIGTERM received, shutting down ...\n");
+    }
     signal(SIGTERM, SIG_IGN);
+    terminate();
+  }
+  if (signum == SIGINT) {
+    if (verbose) {
+      printf("SIGINT received, shutting down ...\n");
+    }
+    signal(SIGINT, SIG_IGN);
+    terminate();
   }
 }
 
@@ -196,19 +251,22 @@ int main(int argc, char **argv)
   char c;
   char *serialport = NULL;
   char *name = NULL;
+
   int iret1, iret2;
-  pthread_t thread1, thread2;
+  pthread_t net_thread, onewire_thread;
   struct sigaction sa;
-  
+
   sa.sa_flags = 0;
   sa.sa_handler = signal_handler;
   sigemptyset(&sa.sa_mask);
-  if (sigaction(SIGTERM, &sa, NULL) < 0) {
+  if (sigaction(SIGTERM, &sa, NULL) < 0 || sigaction(SIGINT, &sa, NULL) < 0 ) {
     fprintf(stderr, "Signal handler could not be set!\n");
     return 1;
   }
-  
-  while ((c = getopt(argc, argv, "n:s:")) != -1) {
+
+  verbose = 0;
+
+  while ((c = getopt(argc, argv, "n:s:v")) != -1) {
     switch (c) {
 
       case 'n':
@@ -224,23 +282,37 @@ int main(int argc, char **argv)
         }
         serialport = strdup(optarg);
         break;
+
+      case 'v':
+        verbose = 1;
+        break;
     }
   }
   if (!serialport) {
     serialport = strdup("/dev/ttyUSB0");
+    if (verbose) {
+      printf("Serial port undefined, using %s as a serial port.\n", serialport);
+    }
   }
-  
-  iret1 = pthread_create(&thread1, NULL, net, (void *)name);
-  iret2 = pthread_create(&thread2, NULL, onewire, (void *)serialport);
-  
+
+  pipe(net_pipe);
+  pipe(onewire_pipe);
+
+  iret1 = pthread_create(&net_thread, NULL, net, (void *)name);
+  iret2 = pthread_create(&onewire_thread, NULL, onewire, (void *)serialport);
+
   if (!iret1 && !iret2) {
-    printf("%s: Threads are ready.\n", argv[0]);
+    if (verbose) {
+      printf("Threads are ready.\n");
+    }
+    pthread_join(net_thread, NULL);
+    pthread_join(onewire_thread, NULL);
   }
-  
-  pthread_join(thread1, NULL);
-  pthread_join(thread2, NULL);
-  
+  else {
+    terminate();
+  }
+
   free(serialport);
-  
+
   return 0;
 }
